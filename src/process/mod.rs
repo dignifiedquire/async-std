@@ -25,13 +25,15 @@ mod imp;
 #[path = "windows/mod.rs"]
 mod imp;
 
+mod kill;
+
 #[derive(Debug)]
 pub struct Child {
     child: imp::Child,
 
-    pub stdin: Option<ChildStdin>,
-    pub stdout: Option<ChildStdout>,
-    pub stderr: Option<ChildStderr>,
+    pub stdin: Option<imp::ChildStdin>,
+    pub stdout: Option<imp::ChildStdout>,
+    pub stderr: Option<imp::ChildStderr>,
 }
 
 impl Child {
@@ -45,12 +47,6 @@ impl Child {
 
     pub async fn output(self) -> io::Result<Output> {
         unimplemented!();
-    }
-}
-
-impl Child {
-    fn from_inner(child: imp::Child) -> Child {
-        unimplemented!()
     }
 }
 
@@ -185,13 +181,12 @@ impl Command {
     }
 
     pub fn spawn(&mut self) -> io::Result<Child> {
-        let child = imp::spawn(&mut self.inner, std::process::Stdio::inherit(), true)?;
-        Ok(Child::from_inner(child))
+        let child = imp::spawn_child(&mut self.inner)?; //, std::process::Stdio::inherit(), true)?;
+        Ok(child)
     }
 
     pub async fn output(&mut self) -> io::Result<Output> {
-        let child = imp::spawn(&mut self.inner, std::process::Stdio::piped(), false)?;
-        let child = Child::from_inner(child);
+        let child = imp::spawn_child(&mut self.inner)?; //, std::process::Stdio::piped(), false)?;
 
         let output = child.output().await?;
 
@@ -199,8 +194,7 @@ impl Command {
     }
 
     pub async fn status(&mut self) -> io::Result<ExitStatus> {
-        let child = imp::spawn(&mut self.inner, std::process::Stdio::inherit(), true)?;
-        let child = Child::from_inner(child);
+        let child = imp::spawn_child(&mut self.inner)?; //, std::process::Stdio::inherit(), true)?;
 
         let status = child.await?;
 

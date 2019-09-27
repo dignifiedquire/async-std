@@ -43,6 +43,8 @@ pin-utils = "0.1.0-alpha.4"
 slab = "0.4.2"
 kv-log-macro = "1.0.4"
 broadcaster = { version = "0.2.4", optional = true }
+crossbeam-queue = "0.1.2"
+libc = "0.2.62"
 
 [dev-dependencies]
 femme = "1.2.0"
