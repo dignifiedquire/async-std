@@ -2,7 +2,7 @@
 
 use crate::io::{self, Read, Write};
 use crate::prelude::*;
-use crate::task::{blocking, Context, Poll};
+use crate::task::{Context, Poll};
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -17,12 +17,21 @@ pub use std::process::Output;
 #[doc(inline)]
 pub use std::process::Stdio;
 
+#[cfg(not(target_os = "windows"))]
+#[path = "unix/mod.rs"]
+mod imp;
+
+#[cfg(target_os = "windows")]
+#[path = "windows/mod.rs"]
+mod imp;
+
 #[derive(Debug)]
 pub struct Child {
-    handle: blocking::JoinHandle<io::Result<std::process::Child>>,
-    // pub stdin: Option<ChildStdin>,
-    // pub stdout: Option<ChildStdout>,
-    // pub stderr: Option<ChildStderr>,
+    child: imp::Child,
+
+    pub stdin: Option<ChildStdin>,
+    pub stdout: Option<ChildStdout>,
+    pub stderr: Option<ChildStderr>,
 }
 
 impl Child {
@@ -36,6 +45,12 @@ impl Child {
 
     pub async fn output(self) -> io::Result<Output> {
         unimplemented!();
+    }
+}
+
+impl Child {
+    fn from_inner(child: imp::Child) -> Child {
+        unimplemented!()
     }
 }
 
@@ -170,20 +185,23 @@ impl Command {
     }
 
     pub fn spawn(&mut self) -> io::Result<Child> {
-        let handle = blocking::spawn(async move { self.inner.spawn() });
-
-        Ok(Child { handle })
+        let child = imp::spawn(&mut self.inner, std::process::Stdio::inherit(), true)?;
+        Ok(Child::from_inner(child))
     }
 
     pub async fn output(&mut self) -> io::Result<Output> {
-        let child = self.spawn()?;
+        let child = imp::spawn(&mut self.inner, std::process::Stdio::piped(), false)?;
+        let child = Child::from_inner(child);
+
         let output = child.output().await?;
 
         Ok(output)
     }
 
     pub async fn status(&mut self) -> io::Result<ExitStatus> {
-        let child = self.spawn()?;
+        let child = imp::spawn(&mut self.inner, std::process::Stdio::inherit(), true)?;
+        let child = Child::from_inner(child);
+
         let status = child.await?;
 
         Ok(status)
