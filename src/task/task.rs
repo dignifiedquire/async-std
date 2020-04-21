@@ -3,7 +3,8 @@ use std::fmt;
 use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::thread::ThreadId;
 
 use crate::task::{LocalsMap, TaskId};
 use crate::utils::abort_on_panic;
@@ -43,6 +44,7 @@ pub struct Task {
     /// This pointer is lazily initialized on first use. In most cases, the inner representation is
     /// never touched and therefore we don't allocate it unless it's really needed.
     inner: AtomicPtr<Inner>,
+    last_thread: RwLock<Option<ThreadId>>, // TODO: can we use an atomic::Usize?
 }
 
 unsafe impl Send for Task {}
@@ -62,7 +64,10 @@ impl Task {
                 AtomicPtr::new(raw as *mut Inner)
             }
         };
-        Task { inner }
+        Task {
+            inner,
+            last_thread: Default::default(),
+        }
     }
 
     /// Gets the task's unique identifier.
@@ -78,6 +83,14 @@ impl Task {
     /// [`Builder::name`]: struct.Builder.html#method.name
     pub fn name(&self) -> Option<&str> {
         self.inner().name.as_ref().map(|s| &**s)
+    }
+
+    pub(crate) fn last_thread(&self) -> Option<std::thread::ThreadId> {
+        *self.last_thread.read().unwrap()
+    }
+
+    pub(crate) fn set_last_thread(&self, last_thread: std::thread::ThreadId) {
+        *self.last_thread.write().unwrap() = Some(last_thread);
     }
 
     /// Returns the map holding task-local values.
@@ -163,6 +176,7 @@ impl Clone for Task {
         let raw = Arc::into_raw(Arc::clone(&arc));
         Task {
             inner: AtomicPtr::new(raw as *mut Inner),
+            last_thread: RwLock::new(self.last_thread.read().unwrap().clone()),
         }
     }
 }
@@ -172,6 +186,7 @@ impl fmt::Debug for Task {
         f.debug_struct("Task")
             .field("id", &self.id())
             .field("name", &self.name())
+            .field("last_thread", &self.last_thread())
             .finish()
     }
 }

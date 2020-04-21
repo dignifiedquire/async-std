@@ -4,7 +4,7 @@ use kv_log_macro::trace;
 
 use crate::io;
 use crate::rt::RUNTIME;
-use crate::task::{JoinHandle, Task};
+use crate::task::{JoinHandle, Task, TaskId};
 use crate::utils::abort_on_panic;
 
 /// Task builder that configures the settings of a new task.
@@ -69,10 +69,27 @@ impl Builder {
 pub struct Runnable(async_task::Task<Task>);
 
 impl Runnable {
+    pub fn id(&self) -> TaskId {
+        self.0.tag().id()
+    }
+
+    pub(crate) fn last_thread(&self) -> Option<std::thread::ThreadId> {
+        self.0.tag().last_thread()
+    }
+
     /// Runs the task by polling its future once.
     pub fn run(self) {
         unsafe {
-            Task::set_current(self.0.tag(), || abort_on_panic(|| self.0.run()));
+            Task::set_current(self.0.tag(), || {
+                abort_on_panic(|| {
+                    let task_id = self.0.tag().id().0;
+                    trace!("run:start", { task_id: task_id });
+                    self.0.tag().set_last_thread(std::thread::current().id());
+                    let res = self.0.run();
+                    trace!("run:stop", { task_id: task_id });
+                    res
+                })
+            });
         }
     }
 }
