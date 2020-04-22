@@ -170,7 +170,7 @@ impl Runtime {
     fn ensure_spinning_thread(&self) {
         let n = self.num_spinning_threads();
         trace!("runtime:ensure_thread", { num_spinning_threads: n });
-        if n > 1 {
+        if n > 0 {
             // nothing to do, we have at least one spinning thread.
             return;
         }
@@ -192,17 +192,12 @@ impl Runtime {
         if (self.inner.need_machine.load(Ordering::Relaxed) && num_spinning < 2)
             || num_spinning == 0
         {
-            if let Some(m) = self
-                .inner
-                .machines
-                .lock()
-                .unwrap()
-                .values()
-                .find(|m| m.is_parked())
-            {
+            let machines = self.inner.machines.lock().unwrap();
+            if let Some(m) = machines.values().find(|m| m.is_parked()) {
                 // unpark machine
-                m.stop_parking(&self);
-                self.inner.need_machine.store(false, Ordering::Relaxed);
+                if m.stop_parking(&self) {
+                    self.inner.need_machine.store(false, Ordering::Relaxed);
+                }
             } else if let Some(p) = sched.processors.pop() {
                 // create new machine
                 let m = Machine::new(p);
@@ -279,13 +274,13 @@ impl Machine {
     }
 
     fn set_state(&self, state: MachineState) {
-        self.inner.state.store(state as usize, Ordering::Relaxed);
+        self.inner.state.store(state as usize, Ordering::Release);
     }
 
     /// Set this machine into spinning state.
     fn start_spinning(&self, rt: &Runtime) {
         // TODO: write correct atomic compare and update
-        let current = self.inner.state.load(Ordering::Relaxed);
+        let current = self.inner.state.load(Ordering::Acquire);
         if current == MachineState::Running as usize || current == MachineState::Stopped as usize {
             self.set_state(MachineState::Spinning);
             rt.inner
@@ -299,7 +294,7 @@ impl Machine {
         if self.inner.state.compare_and_swap(
             MachineState::Spinning as usize,
             MachineState::Running as usize,
-            Ordering::Relaxed,
+            Ordering::AcqRel,
         ) == MachineState::Spinning as usize
         {
             rt.inner
@@ -309,47 +304,54 @@ impl Machine {
     }
 
     /// Parks the thread
-    fn start_parking(&self, rt: &Runtime) -> Parker {
+    fn start_parking(&self, rt: &Runtime) -> Option<Parker> {
         trace!("machine:park", {});
-        if self.inner.state.compare_and_swap(
+        let old = self.inner.state.compare_and_swap(
             MachineState::Spinning as usize,
             MachineState::Parking as usize,
-            Ordering::Relaxed,
-        ) == MachineState::Spinning as usize
-        {
+            Ordering::AcqRel,
+        );
+        if old == MachineState::Spinning as usize {
             rt.inner
                 .num_spinning_threads
                 .fetch_sub(1, Ordering::Relaxed);
+            let parker = Parker::new();
+            let unparker = parker.unparker().clone();
+            *self.inner.unparker.lock() = Some(unparker);
+            Some(parker)
+        } else {
+            None
         }
-
-        let parker = Parker::new();
-        let unparker = parker.unparker().clone();
-        *self.inner.unparker.lock() = Some(unparker);
-        parker
     }
 
     /// Unparks the OS thread, and moves the machine into spinning.
-    fn stop_parking(&self, rt: &Runtime) {
+    fn stop_parking(&self, rt: &Runtime) -> bool {
         trace!("machine:unpark", {});
         if self.inner.state.compare_and_swap(
             MachineState::Parking as usize,
             MachineState::Spinning as usize,
-            Ordering::Relaxed,
+            Ordering::AcqRel,
         ) == MachineState::Parking as usize
         {
             rt.inner
                 .num_spinning_threads
                 .fetch_add(1, Ordering::Relaxed);
-        }
-
-        if let Some(unparker) = self.inner.unparker.lock().take() {
+            let unparker = self.inner.unparker.lock().take().expect("missing unparker");
             unparker.unpark();
+            true
+        } else {
+            false
         }
     }
 
     /// Returns true if the machine is currently parked.
     fn is_parked(&self) -> bool {
-        self.inner.state.load(Ordering::Relaxed) == MachineState::Parking as usize
+        self.inner.state.load(Ordering::Acquire) == MachineState::Parking as usize
+    }
+
+    /// Returns true if the machine is currently spinning.
+    fn is_spinning(&self) -> bool {
+        self.inner.state.load(Ordering::Acquire) == MachineState::Spinning as usize
     }
 
     /// Spawns the underlying OS thread.
@@ -450,7 +452,9 @@ impl Machine {
         let mut spin_runs = 0;
 
         loop {
-            spin_runs += 1;
+            if self.is_spinning() {
+                spin_runs += 1;
+            }
 
             // Check if `task::yield_now()` was invoked and flush the slot if so.
             YIELD_NOW.with(|flag| {
@@ -513,22 +517,26 @@ impl Machine {
                 continue;
             }
 
+            // no tasks found, mark as spinning
+            self.start_spinning(rt);
+
             if sched.polling {
                 drop(sched);
-
-                if spin_runs < SPIN_RUNS {
-                    continue;
-                } else {
+                // don't park if we are the last spinning one
+                if spin_runs >= SPIN_RUNS {
                     // we have been spinning for a while, lets park this thread.
-                    let parker = self.start_parking(rt);
-                    parker.park();
+                    if let Some(parker) = self.start_parking(rt) {
+                        parker.park();
 
-                    // wake up from parking
-                    spin_runs = 0;
-                    runs = 0;
-                    fails = 0;
-                    continue;
+                        // wake up from parking
+                        spin_runs = 0;
+                        runs = 0;
+                        fails = 0;
+                    } else {
+                        panic!("failed to park, handle me {:?}", thread::current().id());
+                    }
                 }
+                continue;
             }
 
             self.stop_spinning(rt);
