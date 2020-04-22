@@ -169,7 +169,7 @@ impl Runtime {
     fn wake_spinning_thread(&self) {
         let n = self.num_spinning_threads();
         trace!("runtime:wake_thread", { num_spinning_threads: n });
-        if n > 0 {
+        if n > 1 {
             // nothing to do, we have at least one spinning thread.
             return;
         }
@@ -309,6 +309,7 @@ impl Machine {
 
     /// Parks the thread
     fn start_parking(&self, rt: &Runtime) -> Parker {
+        trace!("machine:park", {});
         if self.inner.state.compare_and_swap(
             MachineState::Spinning as usize,
             MachineState::Parking as usize,
@@ -328,6 +329,7 @@ impl Machine {
 
     /// Unparks the OS thread, and moves the machine into spinning.
     fn stop_parking(&self, rt: &Runtime) {
+        trace!("machine:unpark", {});
         if self.inner.state.compare_and_swap(
             MachineState::Parking as usize,
             MachineState::Spinning as usize,
@@ -352,7 +354,6 @@ impl Machine {
     /// Spawns the underlying OS thread.
     fn start(&self, rt: Runtime) {
         let this = self.clone();
-
         thread::Builder::new()
             .name("async-std/machine".to_string())
             .spawn(move || {
@@ -447,8 +448,6 @@ impl Machine {
 
         let mut spin_runs = 0;
 
-        let thread_id = thread::current().id();
-
         loop {
             spin_runs += 1;
 
@@ -535,14 +534,6 @@ impl Machine {
             // stopped spinning, so reset the number of spin_runs
             spin_runs = 0;
 
-            // Take out the machine associated with the current thread.
-            // let mut machines = rt.machines.lock().unwrap();
-            // let m = match machines.remove(&thread_id) {
-            //     None => break, // The processor was stolen.
-            //     Some(m) => m,
-            // };
-            // drop(machines);
-
             // Unlock the schedule poll the reactor until new I/O events arrive.
             sched.polling = true;
             drop(sched);
@@ -551,10 +542,6 @@ impl Machine {
             // Lock the scheduler again and re-register the machine.
             sched = rt.inner.sched.lock().unwrap();
             sched.polling = false;
-            // {
-            //     rt.machines.lock().unwrap().insert(thread_id, m);
-            // }
-
             self.start_spinning(rt);
 
             runs = 0;
@@ -566,6 +553,7 @@ impl Machine {
 
         // Return the processor to the scheduler and remove the machine.
         if let Some(p) = opt_p {
+            let thread_id = thread::current().id();
             let mut sched = rt.inner.sched.lock().unwrap();
             sched.processors.push(p);
             rt.inner.machines.lock().unwrap().remove(&thread_id);
