@@ -2,14 +2,12 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::io;
 use std::iter;
-use std::ptr;
 use std::sync::atomic::{self, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
-use crossbeam_utils::thread::scope;
 use kv_log_macro::trace;
 use once_cell::unsync::OnceCell;
 
@@ -20,7 +18,7 @@ use crate::utils::{abort_on_panic, random};
 
 thread_local! {
     /// A reference to the current machine, if the current thread runs tasks.
-    static MACHINE: OnceCell<Arc<Machine>> = OnceCell::new();
+    static MACHINE: OnceCell<Machine> = OnceCell::new();
 
     /// This flag is set to true whenever `task::yield_now()` is invoked.
     static YIELD_NOW: Cell<bool> = Cell::new(false);
@@ -35,7 +33,12 @@ struct Scheduler {
 }
 
 /// An async runtime.
+#[derive(Clone)]
 pub struct Runtime {
+    inner: Arc<InnerRuntime>,
+}
+
+struct InnerRuntime {
     /// The reactor.
     reactor: Reactor,
 
@@ -49,7 +52,7 @@ pub struct Runtime {
     sched: Mutex<Scheduler>,
 
     /// Running machines.
-    machines: Mutex<HashMap<ThreadId, Arc<Machine>>>,
+    machines: Mutex<HashMap<ThreadId, Machine>>,
 
     need_machine: atomic::AtomicBool,
     num_spinning_threads: atomic::AtomicUsize,
@@ -57,52 +60,20 @@ pub struct Runtime {
 
 impl Runtime {
     /// Creates a new runtime.
-    pub fn new() -> Runtime {
-        let cpus = num_cpus::get().max(1);
-        let processors: Vec<_> = (0..cpus).map(|_| Processor::new()).collect();
-        let stealers = processors.iter().map(|p| p.worker.stealer()).collect();
-
-        Runtime {
-            reactor: Reactor::new().unwrap(),
-            injector: Injector::new(),
-            stealers,
-            sched: Mutex::new(Scheduler {
-                processors,
-                polling: false,
-            }),
-            machines: Mutex::new(HashMap::with_capacity(cpus)),
-            need_machine: atomic::AtomicBool::new(false),
-            num_spinning_threads: atomic::AtomicUsize::new(0),
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(InnerRuntime::new()),
         }
     }
 
     /// Returns a reference to the reactor.
     pub fn reactor(&self) -> &Reactor {
-        &self.reactor
+        &self.inner.reactor
     }
 
     /// Flushes the task slot so that tasks get run more fairly.
     pub fn yield_now(&self) {
         YIELD_NOW.with(|flag| flag.set(true));
-    }
-
-    /// Returns the number of currently ideling threads.
-    fn num_spinning_threads(&self) -> usize {
-        self.num_spinning_threads.load(Ordering::Relaxed)
-    }
-
-    /// Tries to wake an ideling thread, or creates a new one, if none is idle.
-    fn wake_spinning_thread(&self) {
-        let n = self.num_spinning_threads();
-        trace!("runtime:wake_thread", { num_spinning_threads: n });
-        if n > 1 {
-            // nothing to do, we have at least one spinning thread.
-            return;
-        }
-
-        self.need_machine
-            .compare_and_swap(false, true, Ordering::Relaxed);
-        trace!("runtime:wake_thread:need_thread", {});
     }
 
     /// Schedules a task.
@@ -112,7 +83,7 @@ impl Runtime {
         // if we have a last_thread, try scheduling on that machine.
         if let Some(last_thread) = last_thread {
             // TODO: reduce locking
-            let machines = self.machines.lock().unwrap();
+            let machines = self.inner.machines.lock().unwrap();
             if let Some(m) = machines.get(&last_thread) {
                 let m = m.clone();
                 drop(machines);
@@ -132,79 +103,17 @@ impl Runtime {
             match machine.get() {
                 None => {
                     // self.wake_spinning_thread();
-                    self.injector.push(task);
+                    self.inner.injector.push(task);
                     self.notify();
                 }
                 Some(m) => m.schedule(&self, task),
             }
         });
     }
-
-    /// Runs the runtime on the current thread.
-    pub fn run(&self) {
-        scope(|s| {
-            let mut idle = 0;
-            let mut delay = 0;
-
-            loop {
-                // Get a list of new machines to start, if any need to be started.
-                for m in self.make_machines() {
-                    idle = 0;
-                    s.builder()
-                        .name("async-std/machine".to_string())
-                        .spawn(move |_| {
-                            {
-                                let mut machines = self.machines.lock().unwrap();
-                                machines.insert(thread::current().id(), m.clone());
-                            }
-
-                            trace!("machine:spawn", {});
-                            abort_on_panic(|| {
-                                let _ = MACHINE.with(|machine| machine.set(m.clone()));
-                                m.run(self);
-                                trace!("machine:stop", {});
-                            })
-                        })
-                        .expect("cannot start a machine thread");
-                }
-
-                // Sleep for a bit longer if the scheduler state hasn't changed in a while.
-                if idle > 10 {
-                    delay = (delay * 2).min(10_000);
-                } else {
-                    idle += 1;
-                    delay = 1000;
-                }
-
-                thread::sleep(Duration::from_micros(delay));
-            }
-        })
-        .unwrap();
-    }
-
-    /// Returns a list of machines that need to be started.
-    fn make_machines(&self) -> Vec<Arc<Machine>> {
-        let mut sched = self.sched.lock().unwrap();
-        let mut to_start = Vec::new();
-
-        // If no machine has been polling the reactor in a while, that means the runtime is
-        // overloaded with work and we need to start another machine.
-        let num_spinning = self.num_spinning_threads();
-        if (self.need_machine.load(Ordering::Relaxed) && num_spinning < 2) || num_spinning == 0 {
-            if let Some(p) = sched.processors.pop() {
-                let m = Arc::new(Machine::new(p));
-                to_start.push(m.clone());
-                self.need_machine.store(false, Ordering::Relaxed);
-            }
-        }
-
-        to_start
-    }
-
     /// Unparks a thread polling the reactor.
     fn notify(&self) {
         atomic::fence(Ordering::SeqCst);
-        self.reactor.notify().unwrap();
+        self.reactor().notify().unwrap();
     }
 
     /// Attempts to poll the reactor without blocking on it.
@@ -214,37 +123,156 @@ impl Runtime {
     /// This function might not poll the reactor at all so do not rely on it doing anything. Only
     /// use for optimization.
     fn quick_poll(&self) -> io::Result<bool> {
-        if let Ok(sched) = self.sched.try_lock() {
+        if let Ok(sched) = self.inner.sched.try_lock() {
             if !sched.polling {
-                return self.reactor.poll(Some(Duration::from_secs(0)));
+                return self.reactor().poll(Some(Duration::from_secs(0)));
             }
         }
         Ok(false)
     }
+
+    /// Runs the runtime on the current thread.
+    pub fn run(&self) {
+        let mut idle = 0;
+        let mut delay = 0;
+
+        loop {
+            // Get a list of new machines to start, if any need to be started.
+            for m in self.make_machines() {
+                idle = 0;
+                m.start(self.clone());
+            }
+
+            // Sleep for a bit longer if the scheduler state hasn't changed in a while.
+            if idle > 10 {
+                delay = (delay * 2).min(10_000);
+            } else {
+                idle += 1;
+                delay = 1000;
+            }
+
+            thread::sleep(Duration::from_micros(delay));
+        }
+    }
+
+    /// Returns the number of currently ideling threads.
+    fn num_spinning_threads(&self) -> usize {
+        self.inner.num_spinning_threads.load(Ordering::Relaxed)
+    }
+
+    /// Tries to wake an ideling thread, or creates a new one, if none is idle.
+    fn wake_spinning_thread(&self) {
+        let n = self.num_spinning_threads();
+        trace!("runtime:wake_thread", { num_spinning_threads: n });
+        if n > 1 {
+            // nothing to do, we have at least one spinning thread.
+            return;
+        }
+
+        self.inner
+            .need_machine
+            .compare_and_swap(false, true, Ordering::Relaxed);
+        trace!("runtime:wake_thread:need_thread", {});
+    }
+
+    /// Returns a list of machines that need to be started.
+    fn make_machines(&self) -> Vec<Machine> {
+        let mut sched = self.inner.sched.lock().unwrap();
+        let mut to_start = Vec::new();
+
+        // If no machine has been polling the reactor in a while, that means the runtime is
+        // overloaded with work and we need to start another machine.
+        let num_spinning = self.num_spinning_threads();
+        if (self.inner.need_machine.load(Ordering::Relaxed) && num_spinning < 2)
+            || num_spinning == 0
+        {
+            if let Some(p) = sched.processors.pop() {
+                let m = Machine::new(p);
+                to_start.push(m.clone());
+                self.inner.need_machine.store(false, Ordering::Relaxed);
+            }
+        }
+
+        to_start
+    }
+}
+
+impl InnerRuntime {
+    fn new() -> Self {
+        let cpus = num_cpus::get().max(1);
+        let processors: Vec<_> = (0..cpus).map(|_| Processor::new()).collect();
+        let stealers = processors.iter().map(|p| p.worker.stealer()).collect();
+
+        Self {
+            reactor: Reactor::new().unwrap(),
+            injector: Injector::new(),
+            stealers,
+            sched: Mutex::new(Scheduler {
+                processors,
+                polling: false,
+            }),
+            machines: Mutex::new(HashMap::with_capacity(cpus)),
+            need_machine: atomic::AtomicBool::new(false),
+            num_spinning_threads: atomic::AtomicUsize::new(0),
+        }
+    }
 }
 
 /// A thread running a processor.
+#[derive(Clone)]
 struct Machine {
+    inner: Arc<InnerMachine>,
+}
+
+struct InnerMachine {
     /// Holds the processor until it gets stolen.
     processor: Spinlock<Option<Processor>>,
 
     spinning: atomic::AtomicBool,
 }
 
-impl Machine {
-    /// Creates a new machine running a processor.
-    fn new(p: Processor) -> Machine {
-        Machine {
+impl InnerMachine {
+    fn new(p: Processor) -> Self {
+        Self {
             processor: Spinlock::new(Some(p)),
             spinning: atomic::AtomicBool::new(true),
         }
     }
+}
+impl Machine {
+    /// Creates a new machine running a processor.
+    fn new(p: Processor) -> Self {
+        Self {
+            inner: Arc::new(InnerMachine::new(p)),
+        }
+    }
+
+    fn start(&self, rt: Runtime) {
+        let this = self.clone();
+
+        thread::Builder::new()
+            .name("async-std/machine".to_string())
+            .spawn(move || {
+                {
+                    let mut machines = rt.inner.machines.lock().unwrap();
+                    machines.insert(thread::current().id(), this.clone());
+                }
+
+                trace!("machine:spawn", {});
+                abort_on_panic(|| {
+                    let _ = MACHINE.with(|machine| machine.set(this.clone()));
+                    this.run(&rt);
+                    trace!("machine:stop", {});
+                })
+            })
+            .expect("cannot start a machine thread");
+    }
 
     /// Schedules a task onto the machine.
     fn schedule(&self, rt: &Runtime, task: Runnable) {
-        match self.processor.lock().as_mut() {
+        match self.inner.processor.lock().as_mut() {
             None => {
-                rt.injector.push(task);
+                rt.inner.injector.push(task);
                 rt.notify();
                 // rt.wake_spinning_thread();
             }
@@ -252,10 +280,13 @@ impl Machine {
                 p.schedule(rt, task);
                 // we have a task for now, mark as not spinning
                 if self
+                    .inner
                     .spinning
                     .compare_and_swap(true, false, Ordering::Relaxed)
                 {
-                    rt.num_spinning_threads.fetch_sub(1, Ordering::Relaxed);
+                    rt.inner
+                        .num_spinning_threads
+                        .fetch_sub(1, Ordering::Relaxed);
                 }
             }
         }
@@ -266,7 +297,7 @@ impl Machine {
         let mut retry = false;
 
         // First try finding a task in the local queue or in the global queue.
-        if let Some(p) = self.processor.lock().as_mut() {
+        if let Some(p) = self.inner.processor.lock().as_mut() {
             if let Some(task) = p.pop_task() {
                 return Steal::Success(task);
             }
@@ -283,7 +314,7 @@ impl Machine {
 
         // Try finding a task in the local queue, which might hold tasks woken by the reactor. If
         // the local queue is still empty, try stealing from other processors.
-        if let Some(p) = self.processor.lock().as_mut() {
+        if let Some(p) = self.inner.processor.lock().as_mut() {
             if progress {
                 if let Some(task) = p.pop_task() {
                     return Steal::Success(task);
@@ -317,14 +348,16 @@ impl Machine {
         let thread_id = thread::current().id();
 
         // start in spinning mode
-        assert!(self.spinning.load(Ordering::Relaxed));
-        rt.num_spinning_threads.fetch_add(1, Ordering::Relaxed);
+        assert!(self.inner.spinning.load(Ordering::Relaxed));
+        rt.inner
+            .num_spinning_threads
+            .fetch_add(1, Ordering::Relaxed);
 
         loop {
             // Check if `task::yield_now()` was invoked and flush the slot if so.
             YIELD_NOW.with(|flag| {
                 if flag.replace(false) {
-                    if let Some(p) = self.processor.lock().as_mut() {
+                    if let Some(p) = self.inner.processor.lock().as_mut() {
                         p.flush_slot(rt);
                     }
                 }
@@ -337,7 +370,7 @@ impl Machine {
                 runs = 0;
                 rt.quick_poll().unwrap();
 
-                if let Some(p) = self.processor.lock().as_mut() {
+                if let Some(p) = self.inner.processor.lock().as_mut() {
                     if let Steal::Success(task) = p.steal_from_global(rt) {
                         p.schedule(rt, task);
                     }
@@ -364,13 +397,13 @@ impl Machine {
 
             // Put the current thread to sleep a few times.
             if fails <= YIELDS + SLEEPS {
-                let opt_p = self.processor.lock().take();
+                let opt_p = self.inner.processor.lock().take();
                 thread::sleep(Duration::from_micros(10));
-                *self.processor.lock() = opt_p;
+                *self.inner.processor.lock() = opt_p;
                 continue;
             }
 
-            let mut sched = rt.sched.lock().unwrap();
+            let mut sched = rt.inner.sched.lock().unwrap();
 
             // One final check for available tasks while the scheduler is locked.
 
@@ -397,10 +430,13 @@ impl Machine {
             }
 
             if self
+                .inner
                 .spinning
                 .compare_and_swap(true, false, Ordering::Relaxed)
             {
-                rt.num_spinning_threads.fetch_sub(1, Ordering::Relaxed);
+                rt.inner
+                    .num_spinning_threads
+                    .fetch_sub(1, Ordering::Relaxed);
             }
 
             // Take out the machine associated with the current thread.
@@ -414,20 +450,23 @@ impl Machine {
             // Unlock the schedule poll the reactor until new I/O events arrive.
             sched.polling = true;
             drop(sched);
-            rt.reactor.poll(None).unwrap();
+            rt.inner.reactor.poll(None).unwrap();
 
             // Lock the scheduler again and re-register the machine.
-            sched = rt.sched.lock().unwrap();
+            sched = rt.inner.sched.lock().unwrap();
             sched.polling = false;
             // {
             //     rt.machines.lock().unwrap().insert(thread_id, m);
             // }
 
             if !self
+                .inner
                 .spinning
                 .compare_and_swap(false, true, Ordering::Relaxed)
             {
-                rt.num_spinning_threads.fetch_add(1, Ordering::Relaxed);
+                rt.inner
+                    .num_spinning_threads
+                    .fetch_add(1, Ordering::Relaxed);
             }
 
             runs = 0;
@@ -435,13 +474,13 @@ impl Machine {
         }
 
         // When shutting down the thread, take the processor out if still available.
-        let opt_p = self.processor.lock().take();
+        let opt_p = self.inner.processor.lock().take();
 
         // Return the processor to the scheduler and remove the machine.
         if let Some(p) = opt_p {
-            let mut sched = rt.sched.lock().unwrap();
+            let mut sched = rt.inner.sched.lock().unwrap();
             sched.processors.push(p);
-            rt.machines.lock().unwrap().remove(&thread_id);
+            rt.inner.machines.lock().unwrap().remove(&thread_id);
         }
     }
 }
@@ -491,7 +530,7 @@ impl Processor {
 
     /// Steals a task from the global queue.
     fn steal_from_global(&self, rt: &Runtime) -> Steal<Runnable> {
-        let res = rt.injector.steal_batch_and_pop(&self.worker);
+        let res = rt.inner.injector.steal_batch_and_pop(&self.worker);
         if res.is_success() {
             trace!("processor:stole_from_global", {});
         }
@@ -501,11 +540,11 @@ impl Processor {
     /// Steals a task from other processors.
     fn steal_from_others(&self, rt: &Runtime) -> Steal<Runnable> {
         // Pick a random starting point in the list of queues.
-        let len = rt.stealers.len();
+        let len = rt.inner.stealers.len();
         let start = random(len as u32) as usize;
 
         // Create an iterator over stealers that starts from the chosen point.
-        let (l, r) = rt.stealers.split_at(start);
+        let (l, r) = rt.inner.stealers.split_at(start);
         let stealers = r.iter().chain(l.iter());
 
         // Try stealing a batch of tasks from each queue.
