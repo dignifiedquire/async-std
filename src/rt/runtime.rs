@@ -525,13 +525,16 @@ impl Machine {
                 // don't park if we are the last spinning one
                 if spin_runs >= SPIN_RUNS && self.is_spinning() {
                     // we have been spinning for a while, lets park this thread.
-                    let parker = self.start_parking(rt).expect("unexpected park");
-                    parker.park();
+                    if let Some(parker) = self.start_parking(rt) {
+                        parker.park();
 
-                    // wake up from parking
-                    spin_runs = 0;
-                    runs = 0;
-                    fails = 0;
+                        // wake up from parking
+                        spin_runs = 0;
+                        runs = 0;
+                        fails = 0;
+                    } else {
+                        trace!("failed to park", {});
+                    }
                 }
                 continue;
             }
