@@ -79,6 +79,7 @@ impl Runtime {
 
     /// Schedules a task onto the global queue.
     fn schedule_global(&self, task: Runnable) {
+        self.ensure_spinning_thread();
         self.inner.injector.push(task);
         self.notify();
     }
@@ -101,7 +102,7 @@ impl Runtime {
         } else {
             // only wake a spinning thread on the first spawn, which is indicated
             // by the fact that there is no thread_id
-            self.wake_spinning_thread();
+            self.ensure_spinning_thread();
         }
 
         MACHINE.with(|machine| {
@@ -166,9 +167,9 @@ impl Runtime {
     }
 
     /// Tries to wake an ideling thread, or creates a new one, if none is idle.
-    fn wake_spinning_thread(&self) {
+    fn ensure_spinning_thread(&self) {
         let n = self.num_spinning_threads();
-        trace!("runtime:wake_thread", { num_spinning_threads: n });
+        trace!("runtime:ensure_thread", { num_spinning_threads: n });
         if n > 1 {
             // nothing to do, we have at least one spinning thread.
             return;
@@ -177,7 +178,7 @@ impl Runtime {
         self.inner
             .need_machine
             .compare_and_swap(false, true, Ordering::Relaxed);
-        trace!("runtime:wake_thread:need_thread", {});
+        trace!("runtime:ensure_thread:need_thread", {});
     }
 
     /// Returns a list of machines that need to be started.
@@ -580,6 +581,7 @@ impl Processor {
 
     /// Schedules a task to run on this processor.
     fn schedule(&mut self, rt: &Runtime, task: Runnable) {
+        rt.ensure_spinning_thread();
         match self.slot.replace(task) {
             None => {}
             Some(task) => {
