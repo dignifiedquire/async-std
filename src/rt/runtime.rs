@@ -76,6 +76,12 @@ impl Runtime {
         YIELD_NOW.with(|flag| flag.set(true));
     }
 
+    /// Schedules a task onto the global queue.
+    fn schedule_global(&self, task: Runnable) {
+        self.inner.injector.push(task);
+        self.notify();
+    }
+
     /// Schedules a task.
     pub fn schedule(&self, task: Runnable) {
         let last_thread = task.last_thread();
@@ -102,9 +108,7 @@ impl Runtime {
             // Otherwise, push it into the global task queue.
             match machine.get() {
                 None => {
-                    // self.wake_spinning_thread();
-                    self.inner.injector.push(task);
-                    self.notify();
+                    self.schedule_global(task);
                 }
                 Some(m) => m.schedule(&self, task),
             }
@@ -227,18 +231,27 @@ struct Machine {
 struct InnerMachine {
     /// Holds the processor until it gets stolen.
     processor: Spinlock<Option<Processor>>,
+    state: atomic::AtomicUsize,
+}
 
-    spinning: atomic::AtomicBool,
+/// The possible states a machine can be in
+#[repr(usize)]
+enum MachineState {
+    /// The machine is not running, and has no OS thread attached to it.
+    Stopped = 0,
+    Running = 1,
+    Spinning = 2,
 }
 
 impl InnerMachine {
     fn new(p: Processor) -> Self {
         Self {
             processor: Spinlock::new(Some(p)),
-            spinning: atomic::AtomicBool::new(true),
+            state: atomic::AtomicUsize::new(MachineState::Stopped as usize),
         }
     }
 }
+
 impl Machine {
     /// Creates a new machine running a processor.
     fn new(p: Processor) -> Self {
@@ -247,6 +260,37 @@ impl Machine {
         }
     }
 
+    fn set_state(&self, state: MachineState) {
+        self.inner.state.store(state as usize, Ordering::Relaxed);
+    }
+
+    /// Set this machine into spinning state.
+    fn start_spinning(&self, rt: &Runtime) {
+        // TODO: write correct atomic compare and update
+        let current = self.inner.state.load(Ordering::Relaxed);
+        if current == MachineState::Running as usize || current == MachineState::Stopped as usize {
+            self.set_state(MachineState::Spinning);
+            rt.inner
+                .num_spinning_threads
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Set this machine into running state, coming from a spinning state.
+    fn stop_spinning(&self, rt: &Runtime) {
+        if self.inner.state.compare_and_swap(
+            MachineState::Spinning as usize,
+            MachineState::Running as usize,
+            Ordering::Relaxed,
+        ) == MachineState::Spinning as usize
+        {
+            rt.inner
+                .num_spinning_threads
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Spawns the underlying OS thread.
     fn start(&self, rt: Runtime) {
         let this = self.clone();
 
@@ -258,7 +302,11 @@ impl Machine {
                     machines.insert(thread::current().id(), this.clone());
                 }
 
+                // start in spinning mode
+                this.start_spinning(&rt);
+
                 trace!("machine:spawn", {});
+
                 abort_on_panic(|| {
                     let _ = MACHINE.with(|machine| machine.set(this.clone()));
                     this.run(&rt);
@@ -272,22 +320,12 @@ impl Machine {
     fn schedule(&self, rt: &Runtime, task: Runnable) {
         match self.inner.processor.lock().as_mut() {
             None => {
-                rt.inner.injector.push(task);
-                rt.notify();
-                // rt.wake_spinning_thread();
+                rt.schedule_global(task);
             }
             Some(p) => {
                 p.schedule(rt, task);
                 // we have a task for now, mark as not spinning
-                if self
-                    .inner
-                    .spinning
-                    .compare_and_swap(true, false, Ordering::Relaxed)
-                {
-                    rt.inner
-                        .num_spinning_threads
-                        .fetch_sub(1, Ordering::Relaxed);
-                }
+                self.stop_spinning(rt);
             }
         }
     }
@@ -346,12 +384,6 @@ impl Machine {
         let mut fails = 0;
 
         let thread_id = thread::current().id();
-
-        // start in spinning mode
-        assert!(self.inner.spinning.load(Ordering::Relaxed));
-        rt.inner
-            .num_spinning_threads
-            .fetch_add(1, Ordering::Relaxed);
 
         loop {
             // Check if `task::yield_now()` was invoked and flush the slot if so.
@@ -419,26 +451,11 @@ impl Machine {
             // the current thread around since there is too little work to do.
             if sched.polling {
                 drop(sched);
-                // trace!("machine:spin:start", {});
-                // runs = 0;
-                // fails = 0;
-
-                // // mark as spinning
-                // let r = rt.get_spinner();
-                // spinner = Some(r);
+                // TODO: move to less wastefull spinning
                 continue;
             }
 
-            if self
-                .inner
-                .spinning
-                .compare_and_swap(true, false, Ordering::Relaxed)
-            {
-                rt.inner
-                    .num_spinning_threads
-                    .fetch_sub(1, Ordering::Relaxed);
-            }
-
+            self.stop_spinning(rt);
             // Take out the machine associated with the current thread.
             // let mut machines = rt.machines.lock().unwrap();
             // let m = match machines.remove(&thread_id) {
@@ -459,15 +476,7 @@ impl Machine {
             //     rt.machines.lock().unwrap().insert(thread_id, m);
             // }
 
-            if !self
-                .inner
-                .spinning
-                .compare_and_swap(false, true, Ordering::Relaxed)
-            {
-                rt.inner
-                    .num_spinning_threads
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            self.start_spinning(rt);
 
             runs = 0;
             fails = 0;
@@ -504,8 +513,6 @@ impl Processor {
 
     /// Schedules a task to run on this processor.
     fn schedule(&mut self, rt: &Runtime, task: Runnable) {
-        // rt.wake_spinning_thread();
-
         match self.slot.replace(task) {
             None => {}
             Some(task) => {
