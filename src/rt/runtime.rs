@@ -8,6 +8,7 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use crossbeam_utils::sync::{Parker, Unparker};
 use kv_log_macro::trace;
 use once_cell::unsync::OnceCell;
 
@@ -168,7 +169,7 @@ impl Runtime {
     fn wake_spinning_thread(&self) {
         let n = self.num_spinning_threads();
         trace!("runtime:wake_thread", { num_spinning_threads: n });
-        if n > 1 {
+        if n > 0 {
             // nothing to do, we have at least one spinning thread.
             return;
         }
@@ -190,7 +191,19 @@ impl Runtime {
         if (self.inner.need_machine.load(Ordering::Relaxed) && num_spinning < 2)
             || num_spinning == 0
         {
-            if let Some(p) = sched.processors.pop() {
+            if let Some(m) = self
+                .inner
+                .machines
+                .lock()
+                .unwrap()
+                .values()
+                .find(|m| m.is_parked())
+            {
+                // unpark machine
+                m.stop_parking(&self);
+                self.inner.need_machine.store(false, Ordering::Relaxed);
+            } else if let Some(p) = sched.processors.pop() {
+                // create new machine
                 let m = Machine::new(p);
                 to_start.push(m.clone());
                 self.inner.need_machine.store(false, Ordering::Relaxed);
@@ -232,6 +245,8 @@ struct InnerMachine {
     /// Holds the processor until it gets stolen.
     processor: Spinlock<Option<Processor>>,
     state: atomic::AtomicUsize,
+    /// The unparker, only set if the thread is parked.
+    unparker: Spinlock<Option<Unparker>>,
 }
 
 /// The possible states a machine can be in
@@ -241,6 +256,7 @@ enum MachineState {
     Stopped = 0,
     Running = 1,
     Spinning = 2,
+    Parking = 3,
 }
 
 impl InnerMachine {
@@ -248,6 +264,7 @@ impl InnerMachine {
         Self {
             processor: Spinlock::new(Some(p)),
             state: atomic::AtomicUsize::new(MachineState::Stopped as usize),
+            unparker: Spinlock::new(None),
         }
     }
 }
@@ -288,6 +305,48 @@ impl Machine {
                 .num_spinning_threads
                 .fetch_sub(1, Ordering::Relaxed);
         }
+    }
+
+    /// Parks the thread
+    fn start_parking(&self, rt: &Runtime) -> Parker {
+        if self.inner.state.compare_and_swap(
+            MachineState::Spinning as usize,
+            MachineState::Parking as usize,
+            Ordering::Relaxed,
+        ) == MachineState::Spinning as usize
+        {
+            rt.inner
+                .num_spinning_threads
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+
+        let parker = Parker::new();
+        let unparker = parker.unparker().clone();
+        *self.inner.unparker.lock() = Some(unparker);
+        parker
+    }
+
+    /// Unparks the OS thread, and moves the machine into spinning.
+    fn stop_parking(&self, rt: &Runtime) {
+        if self.inner.state.compare_and_swap(
+            MachineState::Parking as usize,
+            MachineState::Spinning as usize,
+            Ordering::Relaxed,
+        ) == MachineState::Parking as usize
+        {
+            rt.inner
+                .num_spinning_threads
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        if let Some(unparker) = self.inner.unparker.lock().take() {
+            unparker.unpark();
+        }
+    }
+
+    /// Returns true if the machine is currently parked.
+    fn is_parked(&self) -> bool {
+        self.inner.state.load(Ordering::Relaxed) == MachineState::Parking as usize
     }
 
     /// Spawns the underlying OS thread.
@@ -378,14 +437,21 @@ impl Machine {
         /// Number of runs in a row before the global queue is inspected.
         const RUNS: u32 = 64;
 
+        /// Number of runs in a row before we go from spinning to parked.
+        const SPIN_RUNS: u32 = 128;
+
         // The number of times the thread found work in a row.
         let mut runs = 0;
         // The number of times the thread didn't find work in a row.
         let mut fails = 0;
 
+        let mut spin_runs = 0;
+
         let thread_id = thread::current().id();
 
         loop {
+            spin_runs += 1;
+
             // Check if `task::yield_now()` was invoked and flush the slot if so.
             YIELD_NOW.with(|flag| {
                 if flag.replace(false) {
@@ -447,15 +513,28 @@ impl Machine {
                 continue;
             }
 
-            // If another thread is already blocked on the reactor, there is no point in keeping
-            // the current thread around since there is too little work to do.
             if sched.polling {
                 drop(sched);
-                // TODO: move to less wastefull spinning
-                continue;
+
+                if spin_runs < SPIN_RUNS {
+                    continue;
+                } else {
+                    // we have been spinning for a while, lets park this thread.
+                    let parker = self.start_parking(rt);
+                    parker.park();
+
+                    // wake up from parking
+                    spin_runs = 0;
+                    runs = 0;
+                    fails = 0;
+                    continue;
+                }
             }
 
             self.stop_spinning(rt);
+            // stopped spinning, so reset the number of spin_runs
+            spin_runs = 0;
+
             // Take out the machine associated with the current thread.
             // let mut machines = rt.machines.lock().unwrap();
             // let m = match machines.remove(&thread_id) {
