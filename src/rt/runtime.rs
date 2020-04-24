@@ -410,22 +410,21 @@ impl Machine {
             }
         }
 
-        // Try polling the reactor, but don't block on it.
-        let progress = rt.quick_poll().unwrap();
-
-        // Try finding a task in the local queue, which might hold tasks woken by the reactor. If
-        // the local queue is still empty, try stealing from other processors.
         if let Some(p) = self.inner.processor.lock().as_mut() {
-            if progress {
-                if let Some(task) = p.pop_task() {
-                    return Steal::Success(task);
-                }
-            }
-
+            // Try stealing from other processors.
             match p.steal_from_others(rt) {
                 Steal::Empty => {}
                 Steal::Retry => retry = true,
                 Steal::Success(task) => return Steal::Success(task),
+            }
+        }
+
+        // Try polling the reactor, but don't block on it.
+        if rt.quick_poll().unwrap() {
+            if let Some(p) = self.inner.processor.lock().as_mut() {
+                if let Some(task) = p.pop_task() {
+                    return Steal::Success(task);
+                }
             }
         }
 
